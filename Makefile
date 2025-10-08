@@ -21,7 +21,7 @@ define Package/ethtool-tunables
   CATEGORY:=Network
   TITLE:=Apply ethtool/ip tunables at boot and hotplug
   URL:=https://github.com/nvandamme/openwrt-ethtool-tunables
-  DEPENDS:=+ethtool +ip-full +ubus +uci +busybox
+  DEPENDS:=+ethtool +ip-tiny +ubus +uci +busybox
 endef
 
 define Package/ethtool-tunables/description
