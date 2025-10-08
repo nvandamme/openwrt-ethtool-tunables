@@ -1,0 +1,1497 @@
+#!/bin/sh /etc/rc.common
+START=12
+NAME="ethtool_tunables"
+
+# Apply ethtool/ip tunables at boot (coldplug), after static renames and before netifd.
+# Boot order:
+#   static-device-names  (START=11) (if installed and enabled)
+#   ethtool_tunables     (START=12)
+#   network (netifd)     (START=20)
+#
+# This script is part of the ethtool_tunables package.
+# See /usr/share/doc/ethtool_tunables
+# Copyright (C) 2025 Nicolas Vandamme <n.vandamme@gmail.com>
+# Released under MIT license.
+# Location: /etc/init.d/ethtool_tunables
+
+TRACE=${TRACE:-0}
+NL="
+" # New line
+
+# don't run within buildroot
+[ -n "${IPKG_INSTROOT}" ] && return 0
+
+# ---------- helpers ----------
+
+log() {
+    # shellcheck disable=SC3043
+    local level=$1
+    shift
+
+    [ "$level" = "debug" ] && [ "$TRACE" = 0 ] && return
+    logger -s -t "$NAME" -p "syslog.$level" -- "$@"
+}
+
+# Run a command, capture output, and log result (ash-safe, ASCII only)
+# usage: run_cmd "<iface-tag>" "<human desc>" <cmd> [args...]
+run_cmd() {
+    # shellcheck disable=SC3043
+    local tag="$1"; shift
+    # shellcheck disable=SC3043
+    local desc="$1"; shift
+    # shellcheck disable=SC3043
+    local out rc
+    set +e
+    out="$("$@" 2>&1)"
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+        log err  "[$tag] $desc -> FAIL: $out"
+        return $rc
+    fi
+    # keep success output quiet unless you prefer:
+    # [ -n "$out" ] && log info "[$tag] $desc -> OK: $out" || log info "[$tag] $desc -> OK"
+    log info "[$tag] $desc -> OK"
+    return 0
+}
+
+# Convert UCI key-value pairs to args
+__kv_args=""
+_add_kv_pairs() {
+    set -- $1
+    while [ $# -gt 1 ]; do
+        # inline normalize: UCI keys use '_' -> ethtool expects '-'
+        __kv_args="$__kv_args $(echo "$1" | tr '_' '-') $2"
+        shift 2
+    done
+}
+
+# Collect all key-value pairs from a section and return as args
+get_kv_args() {
+    __kv_args=""
+    config_list_foreach "$1" "$2" _add_kv_pairs
+    echo "${__kv_args# }"
+}
+
+# For DSA slave ports, return the master device (switch port)
+dsa_master_of() {
+    [ -e "/sys/class/net/$1/master" ] || { echo "$1"; return; }
+    basename "$(readlink -f "/sys/class/net/$1/master")"
+}
+
+# Return true if the interface was UP before we touched it
+admin_was_up() {
+    ip -o link show dev "$1" 2>/dev/null | grep -q '<.*UP.*>'
+}
+
+# Return true if the iface is a "real" netdev (not loopback, bridge, bond, vlan, veth, docker, tun/tap, sit, ip6tnl, macvlan, vxlan, etc.)
+is_real_netdev() {
+    # shellcheck disable=SC3043
+    local iface="$1"
+    [ -n "$iface" ] || return 1
+    [ -d "/sys/class/net/$iface" ] || return 1
+
+    # hard excludes
+    case "$iface" in
+        lo|vmbr*|br-*|bond*|veth*|tun*|tap*|wg*|gre*|gretap*|erspan*|sit*|ip6tnl*|vxlan*|macvlan*|ipvlan*|ifb*|dummy*|docker* )
+            return 1
+            ;;
+    esac
+    # exclude virtual interfaces
+    [ -e "/sys/class/net/$iface/virtual" ] && return 1
+
+    # exclude bridges and bonds (redundant with above, but explicit)
+    [ -d "/sys/class/net/$iface/bridge" ] && return 1
+    [ -d "/sys/class/net/$iface/bonding" ] && return 1
+
+    # strong “real” hints: PCI/SoC device, PHY, DSA phys markers
+    [ -e "/sys/class/net/$iface/device" ] && return 0
+    [ -e "/sys/class/net/$iface/phydev" ] && return 0
+    [ -e "/sys/class/net/$iface/phys_port_name" ] && return 0
+    [ -e "/sys/class/net/$iface/phys_switch_id" ] && return 0
+
+    # allow VLAN subifaces (eth0.100, lan1.10) so we can still set txqueuelen;
+    # they usually expose a lower_* link to the parent
+    ls /sys/class/net/"$iface"/lower_* >/dev/null 2>&1 && return 0
+
+    # default: skip
+    return 1
+}
+
+# return bridge master if $1 is enslaved to a bridge, else empty
+bridge_master_of() {
+    # shellcheck disable=SC3043
+    local ifc="$1"
+    [ -e "/sys/class/net/$ifc/brport/bridge" ] || { echo ""; return 0; }
+    basename "$(readlink -f "/sys/class/net/$ifc/brport/bridge")"
+}
+
+# recursively collect uppers of $1 (incl. itself), de-duped
+_collect_uppers_recursive() {
+    # shellcheck disable=SC3043
+    local root="$1" cur sys dev
+
+    {
+        # seed with the root
+        printf '%s\n' "$root"
+        # first-level uppers
+        for sys in "/sys/class/net/$root"/upper_*; do
+            [ -e "$sys" ] || continue
+            dev="$(basename "$(readlink -f "$sys")")"
+            printf '%s\n' "$dev"
+        done
+    } \
+    | awk 'NF{ if(!seen[$0]++){ q[++n]=$0 } } END{ for(i=1;i<=n;i++) print q[i] }' \
+    | while IFS= read -r cur; do
+        # emit current node
+        printf '%s\n' "$cur"
+        # enqueue its uppers
+        for sys in "/sys/class/net/$cur"/upper_*; do
+            [ -e "$sys" ] || continue
+            dev="$(basename "$(readlink -f "$sys")")"
+            printf '%s\n' "$dev"
+        done
+    done \
+    | awk 'NF{ if(!seen[$0]++){ print } }'
+}
+
+# list logical ifaces whose device/ifname matches $1
+_list_ifaces_on_netdev() {
+    # shellcheck disable=SC3043
+    local dev="$1" sid d
+    for sid in $(uci -q show network | sed -n 's/^\(network\.[^=]*\)=interface$/\1/p'); do
+        d="$(uci -q get "$sid.device" 2>/dev/null || true)"; [ "$d" = "$dev" ] && echo "${sid#network.}"
+        d="$(uci -q get "$sid.ifname" 2>/dev/null || true)"; [ "$d" = "$dev" ] && echo "${sid#network.}"
+    done
+}
+
+# return true if netifd is running any active network instance
+_network_service_active() {
+    if command -v ubus >/dev/null 2>&1; then
+        # returns one line per instance's "running" flag (true/false)
+        if command -v jsonfilter >/dev/null 2>&1; then
+            # any instance with running==true ?
+            ubus -S call service list '{"name":"network"}' 2>/dev/null \
+            | jsonfilter -e '@.network.instances.*.running' \
+            | grep -q '^true$' && return 0 || return 1
+        fi
+        # fallback to grep if jsonfilter missing
+        ubus -S call service list '{"name":"network"}' 2>/dev/null \
+        | grep -q '"running"[[:space:]]*:[[:space:]]*true' && return 0 || return 1
+    fi
+    # last resort (not preferred): look for netifd
+    pgrep -x netifd >/dev/null 2>&1
+}
+
+# bounce only the logical ifaces riding on $1 (and its uppers, and its bridge)
+_netifd_bounce_for_dev() {
+    # shellcheck disable=SC3043
+    local base="$1" br ifs="" i dev
+    for dev in $(_collect_uppers_recursive "$base"); do
+        ifs="$ifs
+$(_list_ifaces_on_netdev "$dev")"
+    done
+    br="$(bridge_master_of "$base")"
+    [ -n "$br" ] && ifs="$ifs
+$(_list_ifaces_on_netdev "$br")"
+    ifs="$(printf '%s\n' "$ifs" | awk 'NF{if(!seen[$0]++){print}}')"
+
+    if [ -n "$ifs" ]; then
+        for i in $ifs; do
+            if command -v ubus >/dev/null 2>&1; then
+                ubus call network.interface."$i" down >/dev/null 2>&1 || true
+                ubus call network.interface."$i" up   >/dev/null 2>&1 || true
+            else
+                ifdown "$i" >/dev/null 2>&1 || true
+                ifup   "$i" >/dev/null 2>&1 || true
+            fi
+            log info "[netifd] bounced '$i' (trigger: $base)"
+        done
+        return 0
+    fi
+    # no mapping -> cheap reload
+    /etc/init.d/network reload >/dev/null 2>&1 || true
+    log info "[netifd] ran network reload (no iface bound to '$base')"
+}
+
+# decide whether to prod netifd based on HOTPLUG/need_down/was_up and which families changed
+_maybe_netifd_soft_reload() { # $1=ip_if  $2=need_down  $3=was_up  $4=changed_mask
+    # shellcheck disable=SC3043
+    local ip_if="$1" need_down="$2" was_up="$3" changed="$4"
+
+    # Hotplug path: 00-netifd runs after us; don’t touch it.
+    [ "${HOTPLUG:-0}" -eq 1 ] && return 0
+
+    # If the network service isn't active yet (e.g., boot before START=20), skip.
+    _network_service_active || { log info "[netifd] service inactive; skip soft reload"; return 0; }
+
+    # Nothing changed -> nothing to bounce
+    [ "$changed" -eq 0 ] && return 0
+
+    # If we flapped link (need_down==0) or link was previously up (was_up==0), bounce dependents
+    if [ "$need_down" -eq 0 ] || [ "$was_up" -eq 0 ]; then
+        _netifd_bounce_for_dev "$ip_if"
+        return 0
+    fi
+
+    # MTU change alone can require upper re-evaluation (PPPoE/VLAN)
+    if [ $((changed & 64)) -ne 0 ]; then
+        _netifd_bounce_for_dev "$ip_if"
+        return 0
+    fi
+
+    # Offload/coalesce/pause/txq normally don't require netifd action
+    return 0
+}
+
+# Detect native UCI device keys (from /etc/config/network) to avoid double-apply.
+has_native_mtu=0
+has_native_rxpause=0
+has_native_txpause=0
+load_native_for() {
+    # shellcheck disable=SC3043
+    local want="$1" sid key val
+    has_native_mtu=0
+    has_native_rxpause=0
+    has_native_txpause=0
+
+    # 1) Named device section: network.<want>=device
+    #    (no .name; options live under network.<want>.*)
+    #    cheap exists check:
+    if uci -q show network 2>/dev/null | grep -q "^network\.${want}=device$"; then
+        # read options (ignore failures)
+        set +e
+        val="$(uci -q get network.${want}.mtu 2>/dev/null)";      [ -n "$val" ] && has_native_mtu=1
+        val="$(uci -q get network.${want}.rxpause 2>/dev/null)";  [ -n "$val" ] && has_native_rxpause=1
+        val="$(uci -q get network.${want}.txpause 2>/dev/null)";  [ -n "$val" ] && has_native_txpause=1
+        set -e
+        return 0
+    fi
+
+    # 2) Anonymous device sections: network.@device[N]=device with .name == want
+    #    Iterate all device SIDs and match their .name to $want
+    #    (An image may have multiple; treat as "present if any")
+    for sid in $(uci -q show network 2>/dev/null | sed -n 's/^\(network\.[^=]*\)=device$/\1/p'); do
+        set +e
+        val="$(uci -q get "$sid.name" 2>/dev/null)"
+        set -e
+        [ "$val" = "$want" ] || continue
+
+        set +e
+        val="$(uci -q get "$sid.mtu" 2>/dev/null)";      [ -n "$val" ] && has_native_mtu=1
+        val="$(uci -q get "$sid.rxpause" 2>/dev/null)";  [ -n "$val" ] && has_native_rxpause=1
+        val="$(uci -q get "$sid.txpause" 2>/dev/null)";  [ -n "$val" ] && has_native_txpause=1
+        set -e
+
+        # we can break early if all three were found
+        [ $has_native_mtu -eq 1 ] && [ $has_native_rxpause -eq 1 ] && [ $has_native_txpause -eq 1 ] && return 0
+    done
+
+    return 0
+}
+
+# Wait only for interfaces explicitly declared via: option ifname '<final-name>'
+# If no device sections have option ifname, we do not wait at all.
+wait_ifaces_ready() {
+    # shellcheck disable=SC3043
+    local tries=20 all=0 sids sid ifn want_list=""
+
+    # build want_list safely (never let uci's non-zero exit stop us)
+    sids="$(uci -q show ethtool 2>/dev/null | sed -n 's/^\(ethtool\.[^=]*\)=device$/\1/p')"
+    [ -z "$sids" ] && return 0
+    for sid in $sids; do
+        ifn="$(uci -q get "$sid.ifname" 2>/dev/null || true)"
+        [ -n "$ifn" ] && want_list="$want_list $ifn"
+    done
+
+    # nothing explicit to wait for
+    [ -z "$want_list" ] && return 0
+
+    while [ "$tries" -gt 0 ]; do
+        all=1
+        for ifn in $want_list; do
+            if [ ! -e "/sys/class/net/$ifn" ]; then
+                all=0
+                break
+            fi
+        done
+
+        if [ "$all" -eq 1 ]; then
+            return 0
+        fi
+
+        # be conservative on BusyBox (fractional sleep may not exist)
+        sleep 1
+
+        # make arithmetic non-fatal when it evaluates to 0 under set -e
+        tries=$((tries - 1)) || true
+    done
+
+    # timeout: don't block boot; hotplug will catch up
+    return 0
+}
+
+# ---- JSON helpers ----
+_json_escape() {  # $1=string
+    # escape backslash, double-quote, and control chars (coarse but safe)
+    echo "$1" | sed \
+      -e 's/\\/\\\\/g' \
+      -e 's/"/\\"/g' \
+      -e ':a;N;$!ba;s/\n/\\n/g' \
+      -e 's/\r/\\r/g' \
+      -e 's/\t/\\t/g'
+}
+
+# Emit one KV result: {"key":"k","config":"v","state":"a","diff":true|false}
+_emit_kv_json() {  # $1=key $2=configured $3=actual
+    # shellcheck disable=SC3043
+    local k d a diff=false
+    k="$(_json_escape "$1")"; d="$(_json_escape "$2")"; a="$(_json_escape "$3")"
+    [ "$d" = "$a" ] || diff=true
+    printf '{"key":"%s","config":"%s","state":"%s","diff":%s}' "$k" "$d" "${a:-}" "$diff"
+}
+
+# Collect a list (space-separated k v k v ...) to JSON array of objects
+_list_to_json_array() {  # $1=ifname $2=fam $3="k1 v1 k2 v2 ..."
+    # shellcheck disable=SC3043
+    local ifc="$1" fam="$2" rest="$3" k v cur first=1
+    [ "$fam" = "priv" ] && rest="$(_canonize_priv_args "$ifc" "$rest")"
+    printf '['
+    set -- $rest
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        case "$fam" in
+            offload)  cur="$(get_offload "$ifc" "$k")" ;;
+            channels) cur="$(get_channel "$ifc" "$k")" ;;
+            ring)     cur="$(get_ring "$ifc" "$k")" ;;
+            coalesce) cur="$(get_coal "$ifc" "$k")" ;;
+            pause)    cur="$(get_pause "$ifc" "$k")" ;;
+            priv)     cur="$(get_priv "$ifc" "$k")" ;;
+        esac
+        [ $first -eq 1 ] && first=0 || printf ','
+        _emit_kv_json "$k" "$v" "${cur:-}"
+    done
+    printf ']'
+}
+
+# ---------- APPLY (used by start_service/reload) ----------
+
+# Return 1 if NO changes needed for the family; 0 if at least one key differs
+_tunable_family_has_diffs() { # $1=fam  $2=ifc  $3=payload
+    # shellcheck disable=SC3043
+    local fam="$1" ifc="$2" rest="$3" k v cur
+
+    case "$fam" in
+        mtu)
+            # single numeric/string configured value in $3
+            # shellcheck disable=SC3043
+            local configured="$rest"
+            [ -n "$configured" ] || return 1  # nothing to do
+            cur="$(get_mtu "$ifc")"
+            # prefer numeric compare if both are integers
+            if printf '%s' "$configured$cur" | grep -qE '^[0-9]+$'; then
+                [ "${cur:-x}" -eq "${configured:-y}" ] 2>/dev/null && return 1 || return 0
+            else
+                [ "$cur" = "$configured" ] && return 1 || return 0
+            fi
+            ;;
+
+        txq)
+            # single numeric/string configured value in $3
+            # shellcheck disable=SC3043
+            local configured="$rest"
+            [ -n "$configured" ] || return 1
+            cur="$(get_txq "$ifc")"
+            if printf '%s' "$configured$cur" | grep -qE '^[0-9]+$'; then
+                [ "${cur:-x}" -eq "${configured:-y}" ] 2>/dev/null && return 1 || return 0
+            else
+                [ "$cur" = "$configured" ] && return 1 || return 0
+            fi
+            ;;
+
+        priv)
+            # Canonicalize keys before comparing
+            rest="$(_canonize_priv_args "$ifc" "$rest")"
+            [ -n "$rest" ] || return 1
+            set -- $rest
+            while [ $# -gt 1 ]; do
+                k="$1"; v="$2"; shift 2
+                cur="$(get_priv "$ifc" "$k")"
+                [ "$cur" = "$v" ] || return 0
+            done
+            return 1
+            ;;
+
+        *)
+            # k v k v ... payload
+            [ -n "$rest" ] || return 1
+            set -- $rest
+            while [ $# -gt 1 ]; do
+                k="$1"; v="$2"; shift 2
+                case "$fam" in
+                    offload)  cur="$(get_offload   "$ifc" "$k")" ;;
+                    channels) cur="$(get_channel   "$ifc" "$k")" ;;
+                    ring)     cur="$(get_ring      "$ifc" "$k")" ;;
+                    coalesce) cur="$(get_coal      "$ifc" "$k")" ;;
+                    pause)    cur="$(get_pause     "$ifc" "$k")" ;;
+                esac
+                [ "$cur" = "$v" ] || return 0   # first mismatch => change needed
+            done
+            return 1  # all match
+            ;;
+    esac
+}
+
+# Apply all settings for one section
+apply_section() {
+    # shellcheck disable=SC3043
+    local sect="$1" ifname et_if ip_if \
+          off_args ch_args ring_args coal_args priv_args pause_args mtu txq \
+          was_up=1 need_down=1 have_changes_ch=0 have_changes_rg=0 have_changes_priv=0 changed_any=0 changed_mask=0
+
+    config_get ifname "$sect" ifname
+    [ -z "$ifname" ] && ifname="$sect"
+
+    et_if="$(dsa_master_of "$ifname")"   # ethtool targets (-L/-G/-C/-K/-A)
+    ip_if="$ifname"                      # iproute2 targets (txqueuelen, optional mtu)
+
+    #log info "processing section '$sect' for iface '$ifname' (ethtool on '$et_if', ip on '$ip_if')"
+
+    if ! is_real_netdev "$ip_if"; then
+        log warn "skipping non-physical iface '$ip_if'"
+        return 0
+    fi
+
+    if [ ! -e "/sys/class/net/$et_if" ]; then
+        log warn "skipping iface '$ifname': ethtool target '$et_if' missing"
+        return 0
+    fi
+
+    log info "applying settings for iface '$ifname' (ethtool on '$et_if', ip on '$ip_if')"
+
+    off_args="$(get_kv_args "$sect" offload)"     # ethtool -K
+    ch_args="$(get_kv_args "$sect" channels)"     # ethtool -L
+    ring_args="$(get_kv_args "$sect" ring)"       # ethtool -G
+    coal_args="$(get_kv_args "$sect" coalesce)"   # ethtool -C
+    priv_args="$(get_kv_args "$sect" priv)"       # ethtool --set-priv-flags
+    priv_args="$(_canonize_priv_args "$et_if" "$priv_args")" # ensure known flags only
+    pause_args="$(get_kv_args "$sect" pause)"     # ethtool -A
+    config_get mtu "$sect" mtu
+    config_get txq "$sect" txqueuelen
+
+    log info "[$ifname] configured settings:"
+    [ -n "$off_args"   ] && log info "  offload:  $off_args"
+    [ -n "$ch_args"    ] && log info "  channels: $ch_args"
+    [ -n "$ring_args"  ] && log info "  ring:    $ring_args"
+    [ -n "$coal_args"  ] && log info "  coalesce: $coal_args"
+    [ -n "$priv_args"  ] && log info "  priv:     $priv_args"
+    [ -n "$pause_args" ] && log info "  pause:    $pause_args"
+    [ -n "$mtu"        ] && log info "  mtu:      $mtu"
+    [ -n "$txq"        ] && log info "  txqueuelen: $txq"
+
+    load_native_for "$et_if"
+    log info "[$ifname] native UCI device settings for '$et_if': mtu=$has_native_mtu rxpause=$has_native_rxpause txpause=$has_native_txpause"
+
+    # Determine if any of the "down-required" families actually need changes
+    [ -n "$ch_args"   ] && _tunable_family_has_diffs channels "$et_if" "$ch_args"   && have_changes_ch=1
+    [ -n "$ring_args" ] && _tunable_family_has_diffs ring    "$et_if" "$ring_args" && have_changes_rg=1
+    [ -n "$priv_args" ] && _tunable_family_has_diffs priv     "$et_if" "$priv_args" && have_changes_priv=1
+
+    # Bring link down only if at least one down-required family really differs
+    if [ $have_changes_ch -eq 1 ] || [ $have_changes_rg -eq 1 ] || [ $have_changes_priv -eq 1 ]; then
+        need_down=0
+    fi
+
+    if admin_was_up "$et_if"; then was_up=0; fi
+
+    # Ifdown (only when needed)
+    if [ $need_down -eq 0 ]; then
+        run_cmd "$ifname" "link down $et_if (prepare channels/ring/priv)" ip link set dev "$et_if" down || true
+    fi
+
+    # Private flags: try batch then pairwise fallback (both logged)
+    if [ -n "$priv_args" ]; then
+        if _tunable_family_has_diffs priv "$et_if" "$priv_args"; then
+            if ! run_cmd "$ifname" "ethtool --set-priv-flags $et_if $priv_args" ethtool --set-priv-flags "$et_if" $priv_args; then
+                log warn "[$ifname] retrying --set-priv-flags pairwise"
+                set -- $priv_args
+                while [ $# -gt 1 ]; do
+                    run_cmd "$ifname" "ethtool --set-priv-flags $et_if $1 $2" ethtool --set-priv-flags "$et_if" "$1" "$2" || true
+                    shift 2
+                done
+            fi
+            changed_any=1; changed_mask=$((changed_mask|4))
+        else
+            log info "[$ifname] priv-flags already configured, skipping"
+        fi
+    fi
+
+    # Channels flags
+    if [ -n "$ch_args" ]; then
+        if _tunable_family_has_diffs channels "$et_if" "$ch_args"; then
+            run_cmd "$ifname" "ethtool -L $et_if $ch_args" ethtool -L "$et_if" $ch_args
+            changed_any=1; changed_mask=$((changed_mask|1))
+        else
+            log info "[$ifname] channels already configured, skipping"
+        fi
+    fi
+
+    # Ring flags
+    if [ -n "$ring_args" ]; then
+        if _tunable_family_has_diffs ring "$et_if" "$ring_args"; then
+            run_cmd "$ifname" "ethtool -G $et_if $ring_args" ethtool -G "$et_if" $ring_args
+            changed_any=1; changed_mask=$((changed_mask|2))
+        else
+            log info "[$ifname] ring already configured, skipping"
+        fi
+    fi
+
+    # Offload flags
+    if [ -n "$off_args" ]; then
+        if _tunable_family_has_diffs offload "$et_if" "$off_args"; then
+            run_cmd "$ifname" "ethtool -K $et_if $off_args" ethtool -K "$et_if" $off_args
+            changed_any=1; changed_mask=$((changed_mask|8))
+        else
+            log info "[$ifname] offload already configured, skipping"
+        fi
+    fi
+
+    # Coalesce flags
+    if [ -n "$coal_args" ]; then
+        if _tunable_family_has_diffs coalesce "$et_if" "$coal_args"; then
+            run_cmd "$ifname" "ethtool -C $et_if $coal_args" ethtool -C "$et_if" $coal_args
+            changed_any=1; changed_mask=$((changed_mask|16))
+        else
+            log info "[$ifname] coalesce already configured, skipping"
+        fi
+    fi
+
+    # Pause flags (skip if native)
+    if [ -n "$pause_args" ] && [ $has_native_rxpause -eq 0 ] && [ $has_native_txpause -eq 0 ]; then
+        if _tunable_family_has_diffs pause "$et_if" "$pause_args"; then
+            run_cmd "$ifname" "ethtool -A $et_if $pause_args" ethtool -A "$et_if" $pause_args
+            changed_any=1; changed_mask=$((changed_mask|32))
+        else
+            log info "[$ifname] pause already configured, skipping"
+        fi
+    fi
+
+    # Restore admin state if needed
+    if [ $need_down -eq 0 ] && [ $was_up -eq 0 ]; then
+        run_cmd "$ifname" "link up $et_if" ip link set dev "$et_if" up || true
+    fi
+
+    # MTU (skip if native)
+    if [ -n "$mtu" ] && [ $has_native_mtu -eq 0 ]; then
+        if _tunable_family_has_diffs mtu "$ip_if" "$mtu"; then
+            run_cmd "$ifname" "ip link set $ip_if mtu $mtu" ip link set dev "$ip_if" mtu "$mtu"
+            changed_any=1; changed_mask=$((changed_mask|64))
+        else
+            log info "[$ifname] mtu already $mtu, skipping"
+        fi
+    fi
+
+    # TXQUEUELEN
+    if [ -n "$txq" ]; then
+        if _tunable_family_has_diffs txq "$ip_if" "$txq"; then
+            run_cmd "$ifname" "ip link set $ip_if txqueuelen $txq" ip link set dev "$ip_if" txqueuelen "$txq"
+            changed_any=1; changed_mask=$((changed_mask|128))
+        else
+            log info "[$ifname] txqueuelen already $txq, skipping"
+        fi
+    fi
+
+    # finally, decide whether to prod netifd (uses HOTPLUG/need_down/was_up + changed_mask)
+    _maybe_netifd_soft_reload "$ip_if" "$need_down" "$was_up" "$changed_mask"
+}
+
+# ---------- status helpers ----------
+
+_sed_escape() { printf '%s' "$1" | sed -e 's/[.[\*^$\/]/\\&/g'; }
+
+# cache holders (one iface worth per family)
+__k_if="";  __k_buf=""
+__l_if="";  __l_buf=""
+__g_if="";  __g_buf=""
+__c_if="";  __c_buf=""
+__a_if="";  __a_buf=""
+__p_if="";  __p_buf=""
+__ip_if=""; __ip_buf=""
+
+# cache getters
+_get_cache_k() {  # ensure $__k_buf is the -k output for $1
+    if [ "$__k_if" != "$1" ] || [ -z "$__k_buf" ]; then
+        __k_if="$1"; __k_buf="$(LC_ALL=C ethtool -k "$1" 2>/dev/null || true)"
+    fi
+}
+_get_cache_l() { if [ "$__l_if" != "$1" ] || [ -z "$__l_buf" ]; then __l_if="$1"; __l_buf="$(LC_ALL=C ethtool -l "$1" 2>/dev/null || true)"; fi; }
+_get_cache_g() { if [ "$__g_if" != "$1" ] || [ -z "$__g_buf" ]; then __g_if="$1"; __g_buf="$(LC_ALL=C ethtool -g "$1" 2>/dev/null || true)"; fi; }
+_get_cache_c() { if [ "$__c_if" != "$1" ] || [ -z "$__c_buf" ]; then __c_if="$1"; __c_buf="$(LC_ALL=C ethtool -c "$1" 2>/dev/null || true)"; fi; }
+_get_cache_a() { if [ "$__a_if" != "$1" ] || [ -z "$__a_buf" ]; then __a_if="$1"; __a_buf="$(LC_ALL=C ethtool -a "$1" 2>/dev/null || true)"; fi; }
+_get_cache_p() { if [ "$__p_if" != "$1" ] || [ -z "$__p_buf" ]; then __p_if="$1"; __p_buf="$(LC_ALL=C ethtool --show-priv-flags "$1" 2>/dev/null || true)"; fi; }
+_get_cache_ip() {  # ip -o link (used by mtu/txq)
+    if [ "$__ip_if" != "$1" ] || [ -z "$__ip_buf" ]; then
+        __ip_if="$1"; __ip_buf="$(ip -o link show dev "$1" 2>/dev/null || true)"
+    fi
+}
+
+# offload labels mapper
+_offload_map() {  # $1=key
+    case "$1" in
+        rx)                          echo "rx-checksumming" ;;
+        tx)                          echo "tx-checksumming" ;;
+
+        sg)                          echo "scatter-gather" ;;
+        tso)                         echo "tcp-segmentation-offload" ;;
+        tso4)                        echo "tx-tcp-segmentation" ;;     # alias
+        tso6)                        echo "tx-tcp6-segmentation" ;;    # alias
+        ufo)                         echo "udp-fragmentation-offload" ;;
+        gso)                         echo "generic-segmentation-offload" ;;
+        gro)                         echo "generic-receive-offload" ;;
+        lro)                         echo "large-receive-offload" ;;
+
+        rxvlan)                      echo "rx-vlan-offload" ;;
+        txvlan)                      echo "tx-vlan-offload" ;;
+
+        ntuple|rxnfc)                echo "ntuple-filters" ;;          # rxnfc alias
+        rxhash)                      echo "receive-hashing" ;;
+
+        *)                           echo "$1" ;;
+    esac
+}
+
+# offloads from -k (reads $__k_buf if present)
+get_offload() {  # $1=if $2=key (short or long)
+    # shellcheck disable=SC3043
+    local label lab_esc
+
+    # ensure we have the -k output for this iface in cache
+    _get_cache_k "$1"
+
+    label="$(_offload_map "$2")"
+
+    # Inline _sed_escape: escape sed regex metacharacters in $label
+    lab_esc="$(_sed_escape "$label")"
+
+    if [ -n "$__k_buf" ]; then
+        LC_ALL=C printf "%s\n" "$__k_buf" \
+          | sed -n "s/^[[:space:]]*$lab_esc:[[:space:]]*\(on\|off\).*/\1/p" \
+          | head -n1
+    else
+        LC_ALL=C ethtool -k "$1" 2>/dev/null \
+          | sed -n "s/^[[:space:]]*$lab_esc:[[:space:]]*\(on\|off\).*/\1/p" \
+          | head -n1
+    fi
+}
+
+# channels from -l (reads $__l_buf if present)
+get_channel() {  # $1=if $2=combined|rx|tx
+    # shellcheck disable=SC3043
+    local key label src
+
+    _get_cache_l "$1"
+
+    case "$2" in
+        combined) label='Combined' ;;
+        rx)       label='RX' ;;
+        tx)       label='TX' ;;
+        *)        label="$(echo "$2" | tr '[:lower:]' '[:upper:]')" ;;
+    esac
+
+    if [ -n "$__l_buf" ]; then
+        src="$__l_buf"
+    else
+        src="$(LC_ALL=C ethtool -l "$1" 2>/dev/null)"
+    fi
+
+    printf "%s\n" "$src" | awk -v L="$label" '
+        BEGIN{ sect=0 }
+        /^Current hardware settings:/ { sect=1; next }
+        sect && $1==L":" { print $2; exit }
+    ' | head -n1
+}
+
+# ring from -g (reads $__g_buf if present)
+get_ring() {  # $1=if $2=rx|tx|rx-mini|rx-jumbo
+    # shellcheck disable=SC3043
+    local label src
+
+    _get_cache_g "$1"
+
+    case "$2" in
+        rx)        label='RX' ;;
+        tx)        label='TX' ;;
+        rx-mini)   label='RX Mini' ;;
+        rx-jumbo)  label='RX Jumbo' ;;
+        *)         label="$(echo "$2" | tr '-' ' ' | tr '[:lower:]' '[:upper:]')" ;;
+    esac
+
+    if [ -n "$__g_buf" ]; then
+        src="$__g_buf"
+    else
+        src="$(LC_ALL=C ethtool -g "$1" 2>/dev/null)"
+    fi
+
+    # Parse only the "Current hardware settings:" block and match the full key.
+    printf "%s\n" "$src" | awk -v L1="$label" '
+        BEGIN { sect=0 }
+        # Enter the section
+        /^[[:space:]]*Current hardware settings:/ { sect=1; next }
+        # Exit if we hit an empty line after entering; keeps things tight
+        sect && /^[[:space:]]*$/ { next }
+        sect {
+            # Lines look like:
+            #   "RX:             4096"
+            #   "RX Mini:        0"
+            # Normalize the label to compare precisely (no prefix matches).
+            line=$0
+            sub(/^[[:space:]]*/,"",line)
+            key=line
+            sub(/:[[:space:]]*.*/,"",key)  # strip from colon onward
+            if (key == L1) {
+                # the value is the last field
+                print $NF
+                exit
+            }
+        }
+    ' | head -n1
+}
+
+# coalesce from -c (reads $__c_buf if present)
+get_coal() {  # $1=if $2=key-dash  (e.g., adaptive-rx, adaptive-tx, rx-usecs, tx-frames, ...)
+    # shellcheck disable=SC3043
+    local ifc="$1" key="$2" src
+
+    _get_cache_c "$ifc"
+
+    if [ -n "$__c_buf" ]; then
+        src="$__c_buf"
+    else
+        src="$(LC_ALL=C ethtool -c "$ifc" 2>/dev/null)"
+    fi
+
+    case "$key" in
+        adaptive-rx)
+            printf "%s\n" "$src" | awk '
+                /^Adaptive[[:space:]]+RX:/ {
+                    for (i=1;i<=NF;i++) if ($i=="RX:") { print $(i+1); exit }
+                }' | head -n1
+            ;;
+        adaptive-tx)
+            printf "%s\n" "$src" | awk '
+                /^Adaptive[[:space:]]+RX:/ {
+                    for (i=1;i<=NF;i++) if ($i=="TX:") { print $(i+1); exit }
+                }' | head -n1
+            ;;
+        *)
+            printf "%s\n" "$src" \
+              | sed -n "s/^[[:space:]]*$key:[[:space:]]*\([0-9]\+\).*/\1/p" \
+              | head -n1
+            ;;
+    esac
+}
+
+# pause from -a (reads $__a_buf if present)
+get_pause() {  # $1=if $2=key-dash
+    # shellcheck disable=SC3043
+    local label
+
+    _get_cache_a "$1"
+
+    case "$2" in
+        rx)               label='RX' ;;
+        tx)               label='TX' ;;
+        autoneg|autonegotiate) label='Autonegotiate' ;;
+        *)                label="$(echo "$2" | tr '[:lower:]' '[:upper:]')" ;;
+    esac
+
+    if [ -n "$__a_buf" ]; then
+        printf "%s\n" "$__a_buf" | sed -n "s/^[[:space:]]*$label:[[:space:]]*\(on\|off\).*/\1/p" | head -n1
+    else
+        ethtool -a "$1" 2>/dev/null | sed -n "s/^[[:space:]]*$label:[[:space:]]*\(on\|off\).*/\1/p" | head -n1
+    fi
+}
+
+# cache for priv label canonicalization
+__pmap_if=""
+__pmap_awk=""
+
+# Build (and cache) an awk snippet that maps many input forms -> driver label.
+# Input: iface
+_ensure_priv_map() { # $1=ifc
+    # shellcheck disable=SC3043
+    local ifc="$1" src
+
+    # Reuse cache if the iface matches and we already have the snippet
+    if [ "$__pmap_if" = "$ifc" ] && [ -n "$__pmap_awk" ]; then
+        return 0
+    fi
+
+    # Pull the raw priv-flags output (may be empty on drivers without priv flags)
+    _get_cache_p "$ifc"
+
+    if [ -n "$__p_buf" ]; then
+        src="$__p_buf"
+    else
+        src="$(LC_ALL=C ethtool --show-priv-flags "$ifc" 2>/dev/null)"
+    fi
+
+    # Build an awk program that:
+    #  - extracts each canonical driver label (left column)
+    #  - generates normalized keys (lowercase, hump-split, '_'→'-', collapse '-')
+    #  - maps several variants (raw, lowercase, normalized) back to the canonical label
+    __pmap_awk="$(
+        printf '%s\n' "$src" | awk '
+            # normalizer used both for building the map and for lookup
+            function norm(s,   i,c,p,out){
+                gsub("_","-",s)
+                out=""; p=""
+                for(i=1;i<=length(s);i++){
+                    c=substr(s,i,1)
+                    if (c ~ /[A-Z]/ && p ~ /[a-z0-9]/) out=out "-"
+                    if (c >= "A" && c <= "Z") c = tolower(c)
+                    out = out c; p = substr(s,i,1)
+                }
+                gsub(/-+/, "-", out)
+                sub(/^-+/,"",out); sub(/-+$/,"",out)
+                return out
+            }
+            BEGIN{
+                print "function _pmap_norm(s,   i,c,p,out){"
+                print "  gsub(\"_\",\"-\",s);"
+                print "  out=\"\"; p=\"\";"
+                print "  for(i=1;i<=length(s);i++){ c=substr(s,i,1);"
+                print "    if (c ~ /[A-Z]/ && p ~ /[a-z0-9]/) out=out \"-\";"
+                print "    if (c>=\"A\" && c<=\"Z\") c=tolower(c);"
+                print "    out=out c; p=substr(s,i,1)"
+                print "  }"
+                print "  gsub(/-+/, \"-\", out); sub(/^-+/,\"\",out); sub(/-+$/,\"\",out);"
+                print "  return out"
+                print "}"
+                print "function _pmap_lookup(s,   n){"
+                print "  n=_pmap_norm(s);"
+                print "  if (n in P) return P[n];"
+                print "  return \"\""
+                print "}"
+            }
+            /^[[:space:]]*[^:]+:[[:space:]]*(on|off)/{
+                line=$0
+                sub(/^[[:space:]]*/,"",line)
+                key=line; sub(/:.*/,"",key)      # canonical driver label
+                raw=key
+                # lowercase of the raw label
+                l=raw; out=""
+                for(i=1;i<=length(l);i++){
+                    c=substr(l,i,1)
+                    if (c>="A" && c<="Z") c=tolower(c)
+                    out=out c
+                }
+                low=out
+                # normalized (our matcher form)
+                n=norm(raw)
+
+                # populate map with multiple ways to hit the same label
+                print "P[\"" n "\"]=\"" raw "\""
+                print "P[\"" low "\"]=\"" raw "\""
+                print "P[\"" raw "\"]=\"" raw "\""
+            }
+            END{
+                # no-op; the BEGIN already emitted helpers
+            }
+        '
+    )"
+
+    # update cache keys after successful build (even if empty)
+    __pmap_if="$ifc"
+}
+
+# Return canonical driver label for a priv flag key on iface.
+# Usage: _priv_canon_key "$ifc" "$user_key"
+#  - $user_key can be CamelCase, camelCase, kebab-case, snake_case, ALLCAPS, etc.
+#  - Output is the exact label as printed by: ethtool --show-priv-flags <ifc>
+_priv_canon_key() { # $1=ifc $2=key
+    # shellcheck disable=SC3043
+    local ifc="$1" key="$2" canon
+
+    # If missing args, just echo what we got.
+    [ -n "$ifc" ] && [ -n "$key" ] || { printf '%s\n' "$key"; return 0; }
+
+    # Ensure (and cache) the mapping for this iface.
+    _ensure_priv_map "$ifc"
+
+    if [ -n "$__pmap_awk" ]; then
+        # Use the cached awk program to look up the canonical label.
+        canon="$(awk -v k="$key" "$__pmap_awk"' BEGIN{ r=_pmap_lookup(k); if(r!="") print r }' </dev/null)"
+        if [ -n "$canon" ]; then
+            printf '%s\n' "$canon"
+            return 0
+        fi
+        # Fall through to best-effort normalization if not found.
+    fi
+
+    # Fallback: normalize to dash-lower, splitting camel humps.
+    # (Might not match driver’s exact case, but is a reasonable best-effort.)
+    printf '%s\n' "$key" | awk '
+        function norm(s,   i,c,p,out){
+            gsub("_","-",s)
+            out=""; p=""
+            for(i=1;i<=length(s);i++){
+                c=substr(s,i,1)
+                if (c ~ /[A-Z]/ && p ~ /[a-z0-9]/) out=out "-"
+                if (c>="A" && c<="Z") c=tolower(c)
+                out=out c; p=substr(s,i,1)
+            }
+            gsub(/-+/, "-", out)
+            sub(/^-+/,"",out); sub(/-+$/,"",out)
+            return out
+        }
+        { print norm($0) }'
+}
+
+# Map "k v k v ..." into "canon_k v ..." using _priv_canon_key
+_canonize_priv_args() { # $1=ifc $2="k v k v ..."
+    # shellcheck disable=SC3043
+    local ifc="$1" rest="$2" k v out=""
+    [ -n "$rest" ] || { echo ""; return 0; }
+    set -- $rest
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        k="$(_priv_canon_key "$ifc" "$k")"
+        out="$out $k $v"
+    done
+    printf '%s\n' "${out# }"
+}
+
+# priv flags (reads $__p_buf if present)
+get_priv() {  # $1=if $2=key (underscores already normalized to dashes by your reader)
+    # shellcheck disable=SC3043
+    local ifc="$1" want="$2" src
+
+    _get_cache_p "$ifc"
+
+    if [ -n "$__p_buf" ]; then
+        src="$__p_buf"
+    else
+        src="$(LC_ALL=C ethtool --show-priv-flags "$ifc" 2>/dev/null)"
+    fi
+
+    # Normalize configured key to lowercase; compare against lowercase of each label
+    printf "%s\n" "$src" | awk -v lwant="$(echo "$want" | tr '[:upper:]' '[:lower:]')" '
+        /^[[:space:]]*[^:]+:[[:space:]]*(on|off)/ {
+            line=$0
+            sub(/^[[:space:]]*/,"",line)
+            key=line; sub(/:.*/,"",key)
+            lkey=key; # tolower without gensub for BusyBox awk
+            for(i=1;i<=length(lkey);i++){ c=substr(lkey,i,1); if(c>="A"&&c<="Z") c=tolower(c); buf=buf c } lkey=buf; buf=""
+            if (lkey==lwant) {
+                val=line; sub(/.*:[[:space:]]*/,"",val); sub(/[[:space:]].*/,"",val)
+                print val; exit
+            }
+        }
+    ' | head -n1
+}
+
+# iproute2: mtu
+get_mtu() { # $1=if
+    if [ -r "/sys/class/net/$1/mtu" ]; then
+        cat "/sys/class/net/$1/mtu" 2>/dev/null | head -n1
+        return
+    fi
+    _get_cache_ip "$1"
+    if [ -n "$__ip_buf" ]; then
+        printf "%s\n" "$__ip_buf" | sed -n 's/.* mtu \([0-9]\+\) .*/\1/p' | head -n1
+        return
+    fi
+    ip -o link show dev "$1" 2>/dev/null | sed -n 's/.* mtu \([0-9]\+\) .*/\1/p' | head -n1
+}
+
+# iproute2: txqueuelen
+get_txq() { # $1=if
+    if [ -r "/sys/class/net/$1/tx_queue_len" ]; then
+        cat "/sys/class/net/$1/tx_queue_len" 2>/dev/null | head -n1
+        return
+    fi
+    _get_cache_ip "$1"
+    if [ -n "$__ip_buf" ]; then
+        printf "%s\n" "$__ip_buf" | sed -n 's/.* qlen \([0-9]\+\)$/\1/p' | head -n1
+        return
+    fi
+    ip -o link show dev "$1" 2>/dev/null | sed -n 's/.* qlen \([0-9]\+\)$/\1/p' | head -n1
+}
+
+# ---- fixed-width column layout (ash-safe) ----
+COLW_KEY=24       # width for KEY
+COLW_CFG=12       # width for CONFIGURED
+COLW_STA=12       # width for STATE
+
+_print_header_row() {
+    # one leading tab for section indent, then fixed columns
+    printf "\t%-*s%-*s%-*s%s\n" \
+        "$COLW_KEY" "KEY" \
+        "$COLW_CFG" "CONFIGURED" \
+        "$COLW_STA" "STATE" \
+        "DIFF"
+}
+
+_print_row_aligned() {  # $1=key $2=configured $3=actual $4=OK|DIFF
+    printf "\t%-*s%-*s%-*s[%s]\n" \
+        "$COLW_KEY" "$1" \
+        "$COLW_CFG" "$2" \
+        "$COLW_STA" "$3" \
+        "$4"
+}
+
+# Print status for one family of keys
+_print_kv_status() {  # $1=family $2=if $3="k1 v1 k2 v2 ..."
+    # shellcheck disable=SC3043
+    local fam="$1" ifc="$2" rest="$3" k v a diff
+    [ -n "$rest" ] || return 0
+    printf "  %s:\n" "$fam"
+    [ "$fam" = "priv" ] && rest="$(_canonize_priv_args "$ifc" "$rest")"
+    _print_header_row
+    set -- $rest
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        case "$fam" in
+            offload)  a="$(get_offload "$ifc" "$k")" ;;
+            channels) a="$(get_channel "$ifc" "$k")" ;;
+            ring)    a="$(get_ring "$ifc" "$k")" ;;
+            coalesce) a="$(get_coal "$ifc" "$k")" ;;
+            pause)    a="$(get_pause "$ifc" "$k")" ;;
+            priv)     a="$(get_priv "$ifc" "$k")" ;;
+        esac
+        [ "$a" = "$v" ] && diff="OK" || diff="DIFF"
+        _print_row_aligned "$k" "$v" "${a:-?}" "$diff"
+    done
+}
+
+# Print status for one IP key (mtu or txqueuelen)
+_print_ip_status() {
+    # $1=label, $2=configured, $3=actual_fn, $4=ifname
+    # shellcheck disable=SC3043
+    local label="$1" configured="$2" actual_fn="$3" ifname="$4" a diff
+    a="$($actual_fn "$ifname")"
+    [ "$a" = "$configured" ] && diff="OK" || diff="DIFF"
+    _print_row_aligned "$label" "$configured" "${a:-?}" "$diff"
+}
+
+# Print status for one section
+_status_one() { # $1=section
+    # shellcheck disable=SC3043
+    local sect="$1" ifname et_if ip_if
+    config_get ifname "$sect" ifname
+    [ -z "$ifname" ] && ifname="$sect"
+
+    et_if="$(dsa_master_of "$ifname")"
+    ip_if="$ifname"
+
+    is_real_netdev "$ip_if" || return 0 # skip non-physical
+    [ -e "/sys/class/net/$et_if" ] || return 0 # check ethtool target exists
+
+    # get configured (space "k v" pairs)
+    # shellcheck disable=SC3043
+    local off_args ch_args ring_args coal_args priv_args pause_args mtu txq
+    off_args="$(get_kv_args "$sect" offload)"
+    ch_args="$(get_kv_args "$sect" channels)"
+    ring_args="$(get_kv_args "$sect" ring)"
+    coal_args="$(get_kv_args "$sect" coalesce)"
+    priv_args="$(get_kv_args "$sect" priv)"
+    priv_args="$(_canonize_priv_args "$et_if" "$priv_args")" # canonicalize priv keys
+    pause_args="$(get_kv_args "$sect" pause)"
+    config_get mtu "$sect" mtu
+    config_get txq "$sect" txqueuelen
+
+    # get ethtool actuals and print table(s)
+    echo "iface: $ifname  (ethtool on: $et_if   ip on: $ip_if)"
+    [ -n "$off_args"   ] && _print_kv_status "offload"  "$et_if" "$off_args"
+    [ -n "$ch_args"    ] && _print_kv_status "channels" "$et_if" "$ch_args"
+    [ -n "$ring_args"  ] && _print_kv_status "ring"     "$et_if" "$ring_args"
+    [ -n "$coal_args"  ] && _print_kv_status "coalesce" "$et_if" "$coal_args"
+    [ -n "$pause_args" ] && _print_kv_status "pause"    "$et_if" "$pause_args"
+    [ -n "$priv_args"  ] && _print_kv_status "priv"     "$et_if" "$priv_args"
+
+    # get ip actuals and print table if needed
+    if [ -n "$mtu" ]; then
+        _print_ip_status "mtu" "$mtu" get_mtu "$ip_if"
+    fi
+    if [ -n "$txq" ]; then
+        _print_ip_status "txqueuelen" "$txq" get_txq "$ip_if"
+    fi
+
+    echo # blank line between ifaces
+}
+
+# Print JSON status for one section
+__json_first_iface=1
+_status_json_one() {  # $1=sect
+    # shellcheck disable=SC3043
+    local sect="$1" ifname et_if ip_if
+    config_get ifname "$sect" ifname
+    [ -z "$ifname" ] && ifname="$sect"
+
+    et_if="$(dsa_master_of "$ifname")"
+    ip_if="$ifname"
+    is_real_netdev "$ip_if" || return 0
+    [ -e "/sys/class/net/$et_if" ] || return 0
+
+    # configured (space "k v" pairs)
+    # shellcheck disable=SC3043
+    local off_args ch_args ring_args coal_args priv_args pause_args mtu txq
+    off_args="$(get_kv_args "$sect" offload)"
+    ch_args="$(get_kv_args "$sect" channels)"
+    ring_args="$(get_kv_args "$sect" ring)"
+    coal_args="$(get_kv_args "$sect" coalesce)"
+    priv_args="$(get_kv_args "$sect" priv)"
+    priv_args="$(_canonize_priv_args "$et_if" "$priv_args")" # canonicalize priv keys
+    pause_args="$(get_kv_args "$sect" pause)"
+    config_get mtu "$sect" mtu
+    config_get txq "$sect" txqueuelen
+
+    [ $__json_first_iface -eq 1 ] && __json_first_iface=0 || printf ','
+
+    printf '{"iface":"%s","ethtool_if":"%s","ip_if":"%s"' \
+            "$(_json_escape "$ifname")" "$(_json_escape "$et_if")" "$(_json_escape "$ip_if")"
+
+    # shellcheck disable=SC3043
+    local need_comma=0
+
+    # ethtool object generation
+    printf ',"ethtool":{'
+    if [ -n "$off_args" ]; then
+        printf '"offload":'; _list_to_json_array "$et_if" "offload" "$off_args"; need_comma=1
+    fi
+    if [ -n "$ch_args" ]; then
+        [ $need_comma -eq 1 ] && printf ','
+        printf '"channels":'; _list_to_json_array "$et_if" "channels" "$ch_args"; need_comma=1
+    fi
+    if [ -n "$ring_args" ]; then
+        [ $need_comma -eq 1 ] && printf ','
+        printf '"ring":'; _list_to_json_array "$et_if" "ring" "$ring_args"; need_comma=1
+    fi
+    if [ -n "$coal_args" ]; then
+        [ $need_comma -eq 1 ] && printf ','
+        printf '"coalesce":'; _list_to_json_array "$et_if" "coalesce" "$coal_args"; need_comma=1
+    fi
+    if [ -n "$pause_args" ]; then
+        [ $need_comma -eq 1 ] && printf ','
+        printf '"pause":'; _list_to_json_array "$et_if" "pause" "$pause_args"; need_comma=1
+    fi
+    if [ -n "$priv_args" ]; then
+        [ $need_comma -eq 1 ] && printf ','
+        printf '"priv":'; _list_to_json_array "$et_if" "priv" "$priv_args"; need_comma=1
+    fi
+    printf '}'
+
+    # ip object generation
+    printf ',"ip":{'
+    # shellcheck disable=SC3043
+    local a diff
+    need_comma=0
+    if [ -n "$mtu" ]; then
+        need_comma=1; a="$(get_mtu "$ip_if")"; diff=false; [ "$a" = "$mtu" ] || diff=true
+        printf '"mtu":{"config":"%s","state":"%s","diff":%s}' "$(_json_escape "$mtu")" "$(_json_escape "${a:-}")" "$diff"
+    fi
+    if [ -n "$txq" ]; then
+        a="$(get_txq "$ip_if")"; diff=false; [ "$a" = "$txq" ] || diff=true
+        [ $need_comma -eq 1 ] && printf ','
+        printf '"txqueuelen":{"config":"%s","state":"%s","diff":%s}' "$(_json_escape "$txq")" "$(_json_escape "${a:-}")" "$diff"
+    fi
+    printf '}'
+
+    printf '}'
+}
+
+# ------------------- status_diff -------------------
+
+__status_diff_diffs=0
+_kv_diff() { # $1=fam $2=ifc $3="k v ..."
+    # shellcheck disable=SC3043
+    local fam="$1" ifc="$2" rest="$3" k v a any=1
+    [ -n "$rest" ] || return 1
+    [ "$fam" = "priv" ] && rest="$(_canonize_priv_args "$ifc" "$rest")"
+    set -- $rest
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        case "$fam" in
+            offload)  a="$(get_offload  "$ifc" "$k")" ;;
+            channels) a="$(get_channel  "$ifc" "$k")" ;;
+            ring)     a="$(get_ring     "$ifc" "$k")" ;;
+            coalesce) a="$(get_coal     "$ifc" "$k")" ;;
+            pause)    a="$(get_pause    "$ifc" "$k")" ;;
+            priv)     a="$(get_priv     "$ifc" "$k")" ;;
+        esac
+        [ "$a" = "$v" ] && continue
+        [ $any -eq 1 ] && echo "  $fam:" && _print_header_row && any=0
+        __status_diff_diffs=1
+        _print_row_aligned "$k" "$v" "${a:-?}" "DIFF"
+    done
+    [ $any -eq 0 ]
+}
+
+__status_diff_ifname=""
+__status_diff_et_if=""
+__status_diff_ip_if=""
+__status_diff_diffed=0
+_status_diff_maybe_header() {
+    if [ "$__status_diff_diffed" -eq 1 ]; then return; fi
+    echo "iface: $__status_diff_ifname  (ethtool on: $__status_diff_et_if   ip on: $__status_diff_ip_if)"
+    __status_diff_diffed=1
+}
+
+_status_diff_one() {
+    # shellcheck disable=SC3043
+    local sect="$1" ifname et_if ip_if off ch ring coal priv pause mtu txq a
+
+    config_get ifname "$sect" ifname; [ -z "$ifname" ] && ifname="$sect"
+    et_if="$(dsa_master_of "$ifname")"; ip_if="$ifname"
+    is_real_netdev "$ip_if" || return 0
+    [ -e "/sys/class/net/$et_if" ] || return 0
+
+    off="$(get_kv_args "$sect" offload)"
+    ch="$(get_kv_args "$sect" channels)"
+    ring="$(get_kv_args "$sect" ring)"
+    coal="$(get_kv_args "$sect" coalesce)"
+    priv="$(get_kv_args "$sect" priv)"
+    priv="$(_canonize_priv_args "$et_if" "$priv")" # canonicalize priv keys
+    pause="$(get_kv_args "$sect" pause)"
+    config_get mtu "$sect" mtu; config_get txq "$sect" txqueuelen
+
+    __status_diff_ifname="$ifname"
+    __status_diff_et_if="$et_if"
+    __status_diff_ip_if="$ip_if"
+    __status_diff_diffed=0
+
+    _kv_diff "offload"  "$et_if" "$off"   >/dev/null 2>&1 && _status_diff_maybe_header || true
+    _kv_diff "channels" "$et_if" "$ch"    >/dev/null 2>&1 && _status_diff_maybe_header || true
+    _kv_diff "ring"    "$et_if" "$ring"  >/dev/null 2>&1 && _status_diff_maybe_header || true
+    _kv_diff "coalesce" "$et_if" "$coal"  >/dev/null 2>&1 && _status_diff_maybe_header || true
+    _kv_diff "pause"    "$et_if" "$pause" >/dev/null 2>&1 && _status_diff_maybe_header || true
+    _kv_diff "priv"     "$et_if" "$priv"  >/dev/null 2>&1 && _status_diff_maybe_header || true
+
+    if [ -n "$mtu" ]; then
+        a="$(get_mtu "$ip_if")"
+        [ "$a" = "$mtu" ] || {
+                _status_diff_maybe_header
+                _print_row_aligned "mtu" "$mtu" "${a:-?}" "DIFF"
+                __status_diff_diffs=1
+            }
+    fi
+    if [ -n "$txq" ]; then
+        a="$(get_txq "$ip_if")"
+        [ "$a" = "$txq" ] || {
+            _status_diff_maybe_header
+            _print_row_aligned "txqueuelen" "$txq" "${a:-?}" "DIFF"
+            __status_diff_diffs=1
+        }
+    fi
+
+    [ "$__status_diff_diffed" -eq 1 ] && echo
+}
+
+# Match/apply for only one iface (for hotplug)
+__reload_target_if=""
+__reload_found_sect=0
+_reload_match_and_apply_cb() {
+    # shellcheck disable=SC3043
+    local sect="$1" ifn
+    config_get ifn "$sect" ifname
+    if [ -z "$ifn" ]; then
+        # section name is implicit ifname iff section is *named*
+        # anonymous section has an auto cfg* id; that will never match DEVICENAME
+        case "$sect" in
+            cfg[0-9a-fA-F]*)
+                log warn "section '$sect' is anonymous and has no 'option ifname'; cannot match hotplug iface '${__reload_target_if}'"
+                return 0
+                ;;
+
+            *) ifn="$sect" ;;
+        esac
+    fi
+    [ "$ifn" = "$__reload_target_if" ] || return 0
+    apply_section "$sect"
+    __reload_found_sect=1
+}
+
+# ---------- SERVICE COMMANDS ----------
+
+start() {
+    log info "starting $NAME"
+    wait_ifaces_ready
+    config_load ethtool_tunables
+    config_foreach apply_section device
+    #if command -v ubus >/dev/null 2>&1; then
+    #  payload="$(status_json)"
+    #  # keep it small; ubus has payload size limits
+    #  ubus send ethtool_tunables.status "$payload" >/dev/null 2>&1 || true
+    #fi
+    log info "$NAME finished"
+}
+
+reload() {
+    __reload_target_if=""
+    __reload_found_sect=0
+    # shellcheck disable=SC3043
+    local dev="$DEVICENAME"
+    config_load ethtool_tunables
+    if [ -n "$dev" ]; then
+        __reload_target_if="$dev"; __reload_found_sect=0
+        config_foreach _reload_match_and_apply_cb device
+        [ $__reload_found_sect -eq 1 ] || log warn "reload: no matching section for iface '$dev'"
+    else
+        config_foreach apply_section device
+    fi
+    #if command -v ubus >/dev/null 2>&1; then
+    #    payload="$(status_json)"
+    #    # keep it small; ubus has payload size limits
+    #    ubus send ethtool_tunables.status "$payload" >/dev/null 2>&1 || true
+    #fi
+    log info "$NAME reloaded"
+}
+
+# status command
+extra_command "status" "Service status"
+status() {
+    config_load ethtool_tunables
+    config_foreach _status_one device
+}
+
+# status_json command: print JSON status (for scripts)
+extra_command "status_json" "Service status in JSON"
+status_json() {
+    __json_first_iface=1
+    config_load ethtool_tunables
+    printf '{"ifaces":['
+
+    config_foreach _status_json_one device
+    printf ']}'
+}
+
+extra_command "status_diff" "Show only mismatched tunables (non-zero exit when diffs)"
+status_diff() {
+    __status_diff_diffs=0
+    config_load ethtool_tunables
+    config_foreach _status_diff_one device
+    [ $__status_diff_diffs -eq 0 ]
+}
+
+# capability checks
+__check_result=0
+_check_one_section() {
+    # shellcheck disable=SC3043
+    local s="$1" ifn et_if ip_if off ch ring coal priv pause k v bad_local=0
+    config_get ifn "$s" ifname; [ -z "$ifn" ] && ifn="$s"
+    et_if="$(dsa_master_of "$ifn")"; ip_if="$ifn"
+    is_real_netdev "$ip_if" || return 0
+    [ -e "/sys/class/net/$et_if" ] || return 0
+
+    echo "iface: $ifn"
+
+    # --- offload keys: map short -> -k label, escape, then grep for on|off ---
+    off="$(get_kv_args "$s" offload)"
+    set -- $off
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        label="$(_offload_map "$k")"
+        lab_esc="$(_sed_escape "$label")"
+        if ! LC_ALL=C ethtool -k "$et_if" 2>/dev/null \
+            | grep -qE "^[[:space:]]*${lab_esc}:[[:space:]]*(on|off)"; then
+            echo "  WARN offload key not found: $k  (label: $label)"
+            bad_local=1
+        fi
+    done
+
+    # --- channels present? (basic sanity check on section) ---
+    ch="$(get_kv_args "$s" channels)"
+    [ -n "$ch" ] && LC_ALL=C ethtool -l "$et_if" 2>/dev/null \
+        | sed -n '/^Current hardware settings:/,$p' \
+        | grep -q "^[[:space:]]*\(RX\|TX\|Combined\):" || true
+
+    # --- ring present? ---
+    ring="$(get_kv_args "$s" ring)"
+    [ -n "$ring" ] && LC_ALL=C ethtool -g "$et_if" 2>/dev/null \
+        | sed -n '/^Current hardware settings:/,$p' \
+        | grep -qiE "^[[:space:]]*(RX|RX Mini|RX Jumbo|TX):" || true
+
+    # --- coalesce keys: escape non-adaptive names, allow both Adaptive lines ---
+    coal="$(get_kv_args "$s" coalesce)"
+    set -- $coal
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        case "$k" in
+            adaptive-rx|adaptive-tx)
+                # handled by the Adaptive RX/TX header line
+                if ! LC_ALL=C ethtool -c "$et_if" 2>/dev/null \
+                        | grep -qiE "^Adaptive[[:space:]]+RX:.*TX:"; then
+                    echo "  WARN coalesce adaptive header not found (needed for $k)"
+                    bad_local=1
+                fi
+                ;;
+            *)
+                k_esc="$(_sed_escape "$k")"
+                if ! LC_ALL=C ethtool -c "$et_if" 2>/dev/null \
+                        | grep -qiE "^[[:space:]]*${k_esc}:"; then
+                    echo "  WARN coalesce key not found: $k"
+                    bad_local=1
+                fi
+                ;;
+        esac
+    done
+
+    # --- pause present? ---
+    pause="$(get_kv_args "$s" pause)"
+    [ -n "$pause" ] && LC_ALL=C ethtool -a "$et_if" 2>/dev/null \
+        | grep -qiE "^[[:space:]]*(RX|TX|Autonegotiate):" || true
+
+    # --- priv flags: case-insensitive match on left label column ---
+    priv="$(get_kv_args "$s" priv)"
+    priv="$(_canonize_priv_args "$et_if" "$priv")"
+    set -- $priv
+    while [ $# -gt 1 ]; do
+        k="$1"; v="$2"; shift 2
+        if ! LC_ALL=C ethtool --show-priv-flags "$et_if" 2>/dev/null \
+            | awk -v key="$(echo "$k" | tr '[:upper:]' '[:lower:]')" '
+                /^[[:space:]]*[^:]+:[[:space:]]*(on|off)/{
+                    line=$0; sub(/^[[:space:]]*/,"",line); label=line; sub(/:.*/,"",label)
+                    l=label; for(i=1;i<=length(l);i++){c=substr(l,i,1); if(c>="A"&&c<="Z") c=tolower(c); buf=buf c} l=buf; buf=""
+                    if(l==key){print "1"; exit}
+                }' | grep -q 1; then
+            echo "  WARN priv key not found: $k"
+            bad_local=1
+        fi
+    done
+
+    #echo
+    #[ $bad_local -eq 0 ] || __check_result=1
+    if [ $bad_local -eq 0 ]; then
+        echo "  [OK]"
+    else
+        __check_result=1
+    fi
+    echo
+}
+
+extra_command "check" "Validate configured keys against driver support"
+check() {
+    __check_result=0
+    config_load ethtool_tunables
+    config_foreach _check_one_section device
+    [ $__check_result -eq 0 ]
+}
+
+# debug command: print config and status
+extra_command "debug" "Service debug"
+debug() {
+    # Disable logging to syslog. Send all to stderr.
+    log() {
+        # shellcheck disable=SC3043
+        local level=$1
+        shift
+
+        echo "$level: $*" >&2
+    }
+    log debug "/etc/config/ethtool:\
+        $NL~~~$NL\
+        $(cat /etc/config/ethtool)\
+        $NL~~~"
+    status
+}

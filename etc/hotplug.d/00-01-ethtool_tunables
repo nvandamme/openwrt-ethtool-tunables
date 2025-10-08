@@ -1,0 +1,20 @@
+#!/bin/sh
+# Hotplug order:
+#   00-00-static-name-devices  (rename to final name, if installed & enabled)
+#   00-01-ethtool_tunables     (apply tunables via service reload)
+#   00-netifd                  (netifd consumes the final, tuned iface)
+
+[ "$ACTION" = "add" ] || exit 0
+[ -n "$DEVICENAME" ] || exit 0
+
+. /lib/functions.sh
+
+# UCI toggle
+enabled=0
+config_load ethtool_tunables
+config_get_bool enabled globals hotplug true
+[ "$enabled" -eq 1 ] || exit 0
+
+# Reload
+DEVICENAME="$DEVICENAME" HOTPLUG=1 /etc/init.d/ethtool_tunables reload >/dev/null 2>&1 || \
+    logger -t ethtool-hotplug "init.d reload failed for $DEVICENAME"

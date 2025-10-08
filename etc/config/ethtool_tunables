@@ -1,0 +1,20 @@
+
+config globals 'globals'
+	option hotplug '1'
+
+config device 'eth1'
+	list offload 'sg on'
+	list offload 'gso on'
+	list offload 'gro on'
+	list offload 'tso off'
+	list offload 'rx_gro_list off'
+	list offload 'rx_udp_gro_forwarding on'
+	list ring 'rx 4096'
+	list ring 'tx 4096'
+	option txqueuelen '10000'
+
+config device 'eth2'
+	list ring 'rx 4096'
+	list ring 'tx 4096'
+	option txqueuelen '10000'
+
