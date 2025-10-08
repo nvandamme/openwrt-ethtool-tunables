@@ -67,7 +67,7 @@ config device 'eth1'
 
 > [!IMPORTANT]
 >
-> - Keys under `offload | channels | ring | coalesce | pause | priv` must use `_` in UCI; the script translates to `-` for `ethtool` and can be space-separated lists or repeated list items (e.g. `list offload 'sg on'` or `list offload 'sg on' 'tso on'`).
+> - Keys under `offload | channels | ring | coalesce | pause | priv` must use `_` in UCI; the script translates `_` to `-` for `ethtool` and can be space-separated lists or repeated list items (e.g. `list offload 'sg on'` or `list offload 'sg on' 'tso on'`).
 > - `channels | ring | priv | mtu` will flap the interface down and up to apply the settings.
 
 > [!CAUTION]
