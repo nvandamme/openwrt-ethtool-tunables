@@ -1489,7 +1489,7 @@ debug() {
 
         echo "$level: $*" >&2
     }
-    log debug "/etc/config/ethtool:\
+    log debug "/etc/config/ethtool_tunables:\
         $NL~~~$NL\
         $(cat /etc/config/ethtool_tunables)\
         $NL~~~"
