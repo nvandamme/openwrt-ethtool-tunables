@@ -1491,7 +1491,7 @@ debug() {
     }
     log debug "/etc/config/ethtool:\
         $NL~~~$NL\
-        $(cat /etc/config/ethtool)\
+        $(cat /etc/config/ethtool_tunables)\
         $NL~~~"
     status
 }
