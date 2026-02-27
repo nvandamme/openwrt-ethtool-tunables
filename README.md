@@ -2,6 +2,8 @@
 
 Apply `ethtool`/`ip` tunables at boot (coldplug) **after static device renames** and **before netifd**, and on **net hotplug** events.
 
+Inspired from openwrt package proposal `static-device-names` https://github.com/openwrt/packages/pull/23618 from @jstrot
+
 ## Init script
 
 The init script [`/etc/init.d/ethtool_tunables`](https://github.com/nvandamme/openwrt-ethtool-tunables/blob/main/etc/init.d/ethtool_tunables) supports the standard `start`, `stop`, `reload`, and `enable`/`disable` actions.
